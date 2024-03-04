@@ -6,12 +6,17 @@ Please cite our work if the code is helpful to you.
 """
 
 import os
+import sys
 import weakref
 import torch
 import torch.nn as nn
 import torch.utils.data
 from functools import partial
-from collections import Iterator
+
+if sys.version_info >= (3, 10):
+    from collections.abc import Iterator
+else:
+    from collections import Iterator
 from tensorboardX import SummaryWriter
 
 from .defaults import create_ddp_model, worker_init_fn
@@ -22,8 +27,11 @@ from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
 from pointcept.utils.scheduler import build_scheduler
-from pointcept.utils.losses import build_criteria
 from pointcept.utils.events import EventStorage
+from pointcept.utils.registry import Registry
+
+
+TRAINERS = Registry("trainers")
 
 
 class TrainerBase:
@@ -57,7 +65,10 @@ class TrainerBase:
                 # => before epoch
                 self.before_epoch()
                 # => run_epoch
-                for self.comm_info["iter"], self.comm_info["input_dict"] in self.data_iterator:
+                for (
+                    self.comm_info["iter"],
+                    self.comm_info["input_dict"],
+                ) in self.data_iterator:
                     # => before_step
                     self.before_step()
                     # => run_step
@@ -94,12 +105,15 @@ class TrainerBase:
         self.storage.reset_histories()
 
     def after_train(self):
+        # Sync GPU before running train hooks
+        comm.synchronize()
         for h in self.hooks:
             h.after_train()
         if comm.is_main_process():
             self.writer.close()
 
 
+@TRAINERS.register_module("DefaultTrainer")
 class Trainer(TrainerBase):
     def __init__(self, cfg):
         super(Trainer, self).__init__()
@@ -107,8 +121,10 @@ class Trainer(TrainerBase):
         self.start_epoch = 0
         self.max_epoch = cfg.eval_epoch
         self.best_metric_value = -torch.inf
-        self.logger = get_root_logger(log_file=os.path.join(cfg.save_path, "train.log"),
-                                      file_mode='a' if cfg.resume else 'w')
+        self.logger = get_root_logger(
+            log_file=os.path.join(cfg.save_path, "train.log"),
+            file_mode="a" if cfg.resume else "w",
+        )
         self.logger.info("=> Loading config ...")
         self.cfg = cfg
         self.logger.info(f"Save path: {cfg.save_path}")
@@ -132,7 +148,7 @@ class Trainer(TrainerBase):
         with EventStorage() as self.storage:
             # => before train
             self.before_train()
-            self.logger.info('>>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>')
+            self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
                 # TODO: optimize to iteration based
@@ -142,7 +158,10 @@ class Trainer(TrainerBase):
                 self.data_iterator = enumerate(self.train_loader)
                 self.before_epoch()
                 # => run_epoch
-                for self.comm_info["iter"], self.comm_info["input_dict"] in self.data_iterator:
+                for (
+                    self.comm_info["iter"],
+                    self.comm_info["input_dict"],
+                ) in self.data_iterator:
                     # => before_step
                     self.before_step()
                     # => run_step
@@ -188,9 +207,11 @@ class Trainer(TrainerBase):
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         # logger.info(f"Model: \n{self.model}")
         self.logger.info(f"Num params: {n_parameters}")
-        model = create_ddp_model(model.cuda(),
-                                 broadcast_buffers=False,
-                                 find_unused_parameters=self.cfg.find_unused_parameters)
+        model = create_ddp_model(
+            model.cuda(),
+            broadcast_buffers=False,
+            find_unused_parameters=self.cfg.find_unused_parameters,
+        )
         return model
 
     def build_writer(self):
@@ -206,23 +227,29 @@ class Trainer(TrainerBase):
         else:
             train_sampler = None
 
-        init_fn = partial(
-            worker_init_fn, num_workers=self.cfg.num_worker_per_gpu, rank=comm.get_rank(),
-            seed=self.cfg.seed) if self.cfg.seed is not None else None
+        init_fn = (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
 
-        train_loader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=self.cfg.batch_size_per_gpu,
-                                                   shuffle=(train_sampler is None),
-                                                   num_workers=self.cfg.num_worker_per_gpu,
-                                                   sampler=train_sampler,
-                                                   collate_fn=partial(point_collate_fn,
-                                                                      max_batch_points=self.cfg.max_batch_points,
-                                                                      mix_prob=self.cfg.mix_prob
-                                                                      ),
-                                                   pin_memory=True,
-                                                   worker_init_fn=init_fn,
-                                                   drop_last=True,
-                                                   persistent_workers=True)
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.cfg.batch_size_per_gpu,
+            shuffle=(train_sampler is None),
+            num_workers=self.cfg.num_worker_per_gpu,
+            sampler=train_sampler,
+            collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
+            pin_memory=True,
+            worker_init_fn=init_fn,
+            drop_last=True,
+            persistent_workers=True,
+        )
         return train_loader
 
     def build_val_loader(self):
@@ -233,13 +260,15 @@ class Trainer(TrainerBase):
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
             else:
                 val_sampler = None
-            val_loader = torch.utils.data.DataLoader(val_data,
-                                                     batch_size=self.cfg.batch_size_val_per_gpu,
-                                                     shuffle=False,
-                                                     num_workers=self.cfg.num_worker_per_gpu,
-                                                     pin_memory=True,
-                                                     sampler=val_sampler,
-                                                     collate_fn=collate_fn)
+            val_loader = torch.utils.data.DataLoader(
+                val_data,
+                batch_size=self.cfg.batch_size_val_per_gpu,
+                shuffle=False,
+                num_workers=self.cfg.num_worker_per_gpu,
+                pin_memory=True,
+                sampler=val_sampler,
+                collate_fn=collate_fn,
+            )
         return val_loader
 
     def build_optimizer(self):
@@ -254,3 +283,20 @@ class Trainer(TrainerBase):
     def build_scaler(self):
         scaler = torch.cuda.amp.GradScaler() if self.cfg.enable_amp else None
         return scaler
+
+
+@TRAINERS.register_module("MultiDatasetTrainer")
+class MultiDatasetTrainer(Trainer):
+    def build_train_loader(self):
+        from pointcept.datasets import MultiDatasetDataloader
+
+        train_data = build_dataset(self.cfg.data.train)
+        train_loader = MultiDatasetDataloader(
+            train_data,
+            self.cfg.batch_size_per_gpu,
+            self.cfg.num_worker_per_gpu,
+            self.cfg.mix_prob,
+            self.cfg.seed,
+        )
+        self.comm_info["iter_per_epoch"] = len(train_loader)
+        return train_loader
