@@ -8,10 +8,13 @@ Please cite our work if the code is helpful to you.
 import os
 import sys
 import weakref
+import wandb
 import torch
 import torch.nn as nn
 import torch.utils.data
+from packaging import version
 from functools import partial
+from pathlib import Path
 
 if sys.version_info >= (3, 10):
     from collections.abc import Iterator
@@ -27,16 +30,21 @@ from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
 from pointcept.utils.scheduler import build_scheduler
-from pointcept.utils.events import EventStorage
+from pointcept.utils.events import EventStorage, ExceptionWriter
 from pointcept.utils.registry import Registry
 
 
 TRAINERS = Registry("trainers")
+AMP_DTYPE = dict(
+    float16=torch.float16,
+    bfloat16=torch.bfloat16,
+)
 
 
 class TrainerBase:
     def __init__(self) -> None:
         self.hooks = []
+        self.model = None
         self.epoch = 0
         self.start_epoch = 0
         self.max_epoch = 0
@@ -143,15 +151,15 @@ class Trainer(TrainerBase):
         self.scaler = self.build_scaler()
         self.logger.info("=> Building hooks ...")
         self.register_hooks(self.cfg.hooks)
+        self._gradient_accumulation_counter = 0
 
     def train(self):
-        with EventStorage() as self.storage:
+        with EventStorage() as self.storage, ExceptionWriter():
             # => before train
             self.before_train()
             self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
-                # TODO: optimize to iteration based
                 if comm.get_world_size() > 1:
                     self.train_loader.sampler.set_epoch(self.epoch)
                 self.model.train()
@@ -174,31 +182,74 @@ class Trainer(TrainerBase):
             self.after_train()
 
     def run_step(self):
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            auto_cast = partial(torch.amp.autocast, device_type="cuda")
+        else:
+            # deprecated warning
+            auto_cast = torch.cuda.amp.autocast
+
         input_dict = self.comm_info["input_dict"]
         for key in input_dict.keys():
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
+
+        # Only clear gradients on first accumulation step
+        if self._gradient_accumulation_counter == 0:
+            self.optimizer.zero_grad()
+
+        # Forward pass
+        with auto_cast(
+            enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
+        ):
             output_dict = self.model(input_dict)
-            loss = output_dict["loss"]
-        self.optimizer.zero_grad()
+            loss = (
+                output_dict["loss"] / self.cfg.gradient_accumulation_steps
+            )  # scale loss
+
+        # Backward pass
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-
-            # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
-            # Fix torch warning scheduler step before optimizer step.
-            scaler = self.scaler.get_scale()
-            self.scaler.update()
-            if scaler <= self.scaler.get_scale():
-                self.scheduler.step()
         else:
             loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
+        self._gradient_accumulation_counter += 1
+
+        # Perform optimizer step only when enough gradients have accumulated
+        if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
+            if self.cfg.enable_amp:
+                self.scaler.unscale_(self.optimizer)
+                if self.cfg.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.clip_grad
+                    )
+                self.scaler.step(self.optimizer)
+
+                # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
+                # Fix torch warning scheduler step before optimizer step.
+                scale = self.scaler.get_scale()
+                self.scaler.update()
+                if scale <= self.scaler.get_scale():
+                    self.scheduler.step()
+            else:
+                if self.cfg.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.clip_grad
+                    )
+                self.optimizer.step()
+                self.scheduler.step()
+
+            # Reset grad accumulation counter
+            self._gradient_accumulation_counter = 0
+
         if self.cfg.empty_cache:
             torch.cuda.empty_cache()
         self.comm_info["model_output_dict"] = output_dict
+
+    def after_epoch(self):
+        for h in self.hooks:
+            h.after_epoch()
+        self.storage.reset_histories()
+        if self.cfg.empty_cache_per_epoch:
+            torch.cuda.empty_cache()
 
     def build_model(self):
         model = build_model(self.cfg.model)
@@ -217,6 +268,16 @@ class Trainer(TrainerBase):
     def build_writer(self):
         writer = SummaryWriter(self.cfg.save_path) if comm.is_main_process() else None
         self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")
+        if self.cfg.enable_wandb and comm.is_main_process():
+            tag, name = Path(self.cfg.save_path).parts[-2:]
+            wandb.init(
+                project=self.cfg.wandb_project,
+                name=f"{tag}/{name}",
+                tags=[tag],
+                dir=self.cfg.save_path,
+                settings=wandb.Settings(api_key=self.cfg.wandb_key),
+                config=self.cfg,
+            )
         return writer
 
     def build_train_loader(self):
@@ -247,7 +308,7 @@ class Trainer(TrainerBase):
             collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
             pin_memory=True,
             worker_init_fn=init_fn,
-            drop_last=True,
+            drop_last=len(train_data) > self.cfg.batch_size,
             persistent_workers=True,
         )
         return train_loader
@@ -277,11 +338,20 @@ class Trainer(TrainerBase):
     def build_scheduler(self):
         assert hasattr(self, "optimizer")
         assert hasattr(self, "train_loader")
-        self.cfg.scheduler.total_steps = len(self.train_loader) * self.cfg.eval_epoch
+        self.cfg.scheduler.total_steps = (
+            len(self.train_loader)
+            * self.cfg.eval_epoch
+            // self.cfg.gradient_accumulation_steps
+        )
         return build_scheduler(self.cfg.scheduler, self.optimizer)
 
     def build_scaler(self):
-        scaler = torch.cuda.amp.GradScaler() if self.cfg.enable_amp else None
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            grad_scaler = partial(torch.amp.GradScaler, device="cuda")
+        else:
+            # deprecated warning
+            grad_scaler = torch.cuda.amp.GradScaler
+        scaler = grad_scaler() if self.cfg.enable_amp else None
         return scaler
 
 

@@ -25,7 +25,7 @@ model = dict(
         context_channels=256,
         channels=(32, 64, 128, 256, 256, 128, 96, 96),
         layers=(2, 3, 4, 6, 2, 2, 2, 2),
-        cls_mode=False,
+        enc_mode=False,
         conditions=("ScanNet", "S3DIS", "Structured3D"),
         zero_init=False,
         norm_decouple=True,
@@ -143,7 +143,7 @@ data = dict(
                     dict(type="CenterShift", apply_z=False),
                     dict(type="NormalizeColor"),
                     dict(type="ShufflePoint"),
-                    dict(type="Add", keys_dict={"condition": "Structured3D"}),
+                    dict(type="Update", keys_dict={"condition": "Structured3D"}),
                     dict(type="ToTensor"),
                     dict(
                         type="Collect",
@@ -200,7 +200,7 @@ data = dict(
                     dict(type="CenterShift", apply_z=False),
                     dict(type="NormalizeColor"),
                     dict(type="ShufflePoint"),
-                    dict(type="Add", keys_dict={"condition": "ScanNet"}),
+                    dict(type="Update", keys_dict={"condition": "ScanNet"}),
                     dict(type="ToTensor"),
                     dict(
                         type="Collect",
@@ -229,12 +229,11 @@ data = dict(
                 hash_type="fnv",
                 mode="test",
                 return_grid_coord=True,
-                keys=("coord", "color", "normal"),
             ),
             crop=None,
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
-                dict(type="Add", keys_dict={"condition": "ScanNet"}),
+                dict(type="Update", keys_dict={"condition": "ScanNet"}),
                 dict(type="ToTensor"),
                 dict(
                     type="Collect",
@@ -364,3 +363,14 @@ data = dict(
         ),
     ),
 )
+
+# hook
+hooks = [
+    dict(type="CheckpointLoader"),
+    dict(type="ModelHook"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter"),
+    dict(type="SemSegEvaluator"),
+    dict(type="CheckpointSaver", save_freq=None),
+    dict(type="PreciseEvaluator", test_last=True),
+]

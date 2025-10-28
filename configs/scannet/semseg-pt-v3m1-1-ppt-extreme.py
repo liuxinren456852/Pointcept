@@ -19,6 +19,7 @@ mix_prob = 0.8
 empty_cache = False
 enable_amp = True
 find_unused_parameters = True
+clip_grad = 3.0
 
 # trainer
 train = dict(
@@ -53,7 +54,7 @@ model = dict(
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        cls_mode=False,
+        enc_mode=False,
         pdnorm_bn=True,
         pdnorm_ln=True,
         pdnorm_decouple=True,
@@ -176,7 +177,7 @@ data = dict(
                     dict(type="CenterShift", apply_z=False),
                     dict(type="NormalizeColor"),
                     # dict(type="ShufflePoint"),
-                    dict(type="Add", keys_dict={"condition": "Structured3D"}),
+                    dict(type="Update", keys_dict={"condition": "Structured3D"}),
                     dict(type="ToTensor"),
                     dict(
                         type="Collect",
@@ -233,7 +234,7 @@ data = dict(
                     dict(type="CenterShift", apply_z=False),
                     dict(type="NormalizeColor"),
                     dict(type="ShufflePoint"),
-                    dict(type="Add", keys_dict={"condition": "ScanNet"}),
+                    dict(type="Update", keys_dict={"condition": "ScanNet"}),
                     dict(type="ToTensor"),
                     dict(
                         type="Collect",
@@ -291,7 +292,7 @@ data = dict(
             #         dict(type="CenterShift", apply_z=False),
             #         dict(type="NormalizeColor"),
             #         dict(type="ShufflePoint"),
-            #         dict(type="Add", keys_dict={"condition": "S3DIS"}),
+            #         dict(type="Update", keys_dict={"condition": "S3DIS"}),
             #         dict(type="ToTensor"),
             #         dict(
             #             type="Collect",
@@ -310,20 +311,29 @@ data = dict(
         data_root="data/scannet",
         transform=[
             dict(type="CenterShift", apply_z=True),
+            dict(type="Copy", keys_dict={"segment": "origin_segment"}),
             dict(
                 type="GridSample",
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
+                return_inverse=True,
             ),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Add", keys_dict={"condition": "ScanNet"}),
+            dict(type="Update", keys_dict={"condition": "ScanNet"}),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment", "condition"),
+                keys=(
+                    "coord",
+                    "grid_coord",
+                    "segment",
+                    "condition",
+                    "origin_segment",
+                    "inverse",
+                ),
                 feat_keys=("color", "normal"),
             ),
         ],
@@ -344,13 +354,12 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="test",
-                keys=("coord", "color", "normal"),
                 return_grid_coord=True,
             ),
             crop=None,
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
-                dict(type="Add", keys_dict={"condition": "ScanNet"}),
+                dict(type="Update", keys_dict={"condition": "ScanNet"}),
                 dict(type="ToTensor"),
                 dict(
                     type="Collect",

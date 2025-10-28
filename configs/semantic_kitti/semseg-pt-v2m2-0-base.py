@@ -34,35 +34,16 @@ model = dict(
         enable_checkpoint=False,
         unpool_backend="map",  # map / interp
     ),
+    # fmt: off
     criteria=[
-        dict(
-            type="CrossEntropyLoss",
-            weight=[
-                3.1557,
-                8.7029,
-                7.8281,
-                6.1354,
-                6.3161,
-                7.9937,
-                8.9704,
-                10.1922,
-                1.6155,
-                4.2187,
-                1.9385,
-                5.5455,
-                2.0198,
-                2.6261,
-                1.3212,
-                5.1102,
-                2.5492,
-                5.8585,
-                7.3929,
-            ],
-            loss_weight=1.0,
-            ignore_index=-1,
-        ),
+        dict(type="CrossEntropyLoss",
+             weight=[3.1557, 8.7029, 7.8281, 6.1354, 6.3161, 7.9937, 8.9704, 10.1922, 1.6155, 4.2187,
+                     1.9385, 5.5455, 2.0198, 2.6261, 1.3212, 5.1102, 2.5492, 5.8585, 7.3929],
+             loss_weight=1.0,
+             ignore_index=-1),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
+    # fmt: on
 )
 
 # scheduler settings
@@ -128,7 +109,6 @@ data = dict(
                 grid_size=0.05,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "strength", "segment"),
                 return_grid_coord=True,
             ),
             dict(type="PointClip", point_cloud_range=(-35.2, -35.2, -4, 35.2, 35.2, 2)),
@@ -150,19 +130,20 @@ data = dict(
         split="val",
         data_root=data_root,
         transform=[
+            dict(type="Copy", keys_dict={"segment": "origin_segment"}),
             dict(
                 type="GridSample",
                 grid_size=0.05,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "strength", "segment"),
                 return_grid_coord=True,
+                return_inverse=True,
             ),
             dict(type="PointClip", point_cloud_range=(-35.2, -35.2, -4, 35.2, 35.2, 2)),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment"),
+                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
                 feat_keys=("coord", "strength"),
             ),
         ],
@@ -173,7 +154,17 @@ data = dict(
         type=dataset_type,
         split="val",
         data_root=data_root,
-        transform=[],
+        transform=[
+            dict(type="PointClip", point_cloud_range=(-35.2, -35.2, -4, 35.2, 35.2, 2)),
+            dict(type="Copy", keys_dict={"segment": "origin_segment"}),
+            dict(
+                type="GridSample",
+                grid_size=0.025,
+                hash_type="fnv",
+                mode="train",
+                return_inverse=True,
+            ),
+        ],
         test_mode=True,
         test_cfg=dict(
             voxelize=dict(
@@ -182,14 +173,9 @@ data = dict(
                 hash_type="fnv",
                 mode="test",
                 return_grid_coord=True,
-                keys=("coord", "strength"),
             ),
             crop=None,
             post_transform=[
-                dict(
-                    type="PointClip",
-                    point_cloud_range=(-35.2, -35.2, -4, 35.2, 35.2, 2),
-                ),
                 dict(type="ToTensor"),
                 dict(
                     type="Collect",
